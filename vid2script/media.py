@@ -64,7 +64,10 @@ async def probe(path: Path) -> Video:
         raise FileNotFoundError(path)
     data = json.loads(await run("ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)))
     streams = data["streams"]
-    stream = next(s for s in streams if s["codec_type"] == "video" and not s.get("disposition", {}).get("attached_pic"))
+    stream = next((s for s in streams if s["codec_type"] == "video"
+                   and not s.get("disposition", {}).get("attached_pic")), None)
+    if stream is None:
+        raise ValueError("视频没有可用的画面流")
     duration = float(data["format"]["duration"])
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("视频时长无效")
@@ -90,7 +93,7 @@ class Media:
     def __init__(self, video: Video, root: Path, settings: Settings):
         self.video, self.root, self.settings = video, root, settings
         self.clips = root / "clips"
-        self.clips.mkdir()
+        self.clips.mkdir(exist_ok=True)
 
     @property
     def max_span(self) -> float:
@@ -133,7 +136,7 @@ class Media:
         return Observation(content, [clip_id], tokens)
 
     async def _encode(self, start: float, end: float, crop: list[float] | None) -> tuple[bytes, int, int]:
-        crop_filter, _, _ = self._crop_filter(crop)
+        crop_filter = self._crop_filter(crop)
         attempts = []
         edge, fps, crf = self.settings.video_long_edge, self.settings.video_fps, self.settings.video_crf
         for _ in range(3):
@@ -144,7 +147,7 @@ class Media:
             path.unlink()
         for edge, fps, crf in attempts:
             filters = [crop_filter] if crop_filter else []
-            filters.extend([f"scale='min({edge},iw)':-2", f"fps={fps}", "setsar=1"])
+            filters.extend([f"scale='trunc(min({edge},iw)/2)*2':-2", f"fps={fps}", "setsar=1"])
             await run("ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", str(start),
                       "-i", str(self.video.path), "-t", str(end - start), "-map", "0:v:0", "-an", "-sn",
                       "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
@@ -158,9 +161,9 @@ class Media:
         width, height = await probe_size(target)
         return target.read_bytes(), width, height
 
-    def _crop_filter(self, crop: list[float] | None) -> tuple[str, int, int]:
+    def _crop_filter(self, crop: list[float] | None) -> str:
         if not crop:
-            return "", self.video.width, self.video.height
+            return ""
         x, y, width, height = crop
         if min(x, y) < 0 or min(width, height) <= 0 or x + width > 1 or y + height > 1:
             raise ValueError("裁剪范围必须位于视频内，使用 0 到 1 的相对坐标")
@@ -168,7 +171,7 @@ class Media:
         top = min(self.video.height - 2, int(y * self.video.height) // 2 * 2)
         right = max(left + 2, min(self.video.width, int((x + width) * self.video.width)) // 2 * 2)
         bottom = max(top + 2, min(self.video.height, int((y + height) * self.video.height)) // 2 * 2)
-        return f"crop={right - left}:{bottom - top}:{left}:{top}", right - left, bottom - top
+        return f"crop={right - left}:{bottom - top}:{left}:{top}"
 
     async def audio(self, start: float, end: float) -> Path:
         target = self.root / "audio.wav"
@@ -190,7 +193,7 @@ class Media:
     async def subtitles(self, external: Path | None) -> list[Cue] | None:
         if external is None and self.video.subtitle_index is None:
             return None
-        if external:
+        if external is not None:
             source = external
             if not source.is_file():
                 raise FileNotFoundError(source)

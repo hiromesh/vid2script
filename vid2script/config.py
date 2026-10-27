@@ -49,7 +49,6 @@ class Settings(BaseModel):
             "asr_api_key": "VIDEO_ANALYSIS__ASR_API_KEY",
             "asr_resource_id": "VIDEO_ANALYSIS__ASR_RESOURCE_ID",
             "asr_timeout_seconds": "VIDEO_ANALYSIS__ASR_TIMEOUT_SECONDS",
-            "asr_poll_interval_seconds": "VIDEO_ANALYSIS__ASR_POLL_INTERVAL_SECONDS",
             "oss_endpoint": "OSS__ENDPOINT", "oss_bucket": "OSS__BUCKET",
             "oss_access_key_id": "OSS__ACCESS_KEY_ID",
             "oss_access_key_secret": "OSS__ACCESS_KEY_SECRET",
@@ -58,10 +57,13 @@ class Settings(BaseModel):
 
     def require_asr(self) -> None:
         required = ("asr_api_key", "oss_endpoint", "oss_bucket", "oss_access_key_id", "oss_access_key_secret")
-        missing = [key for key in required if not (
-            getattr(self, key).get_secret_value() if isinstance(getattr(self, key), SecretStr)
-            else getattr(self, key)
-        )]
+        missing = []
+        for key in required:
+            value = getattr(self, key)
+            if isinstance(value, SecretStr):
+                value = value.get_secret_value()
+            if not value:
+                missing.append(key)
         if missing:
             raise ValueError(f"音频识别缺少配置：{', '.join(missing)}")
 
@@ -70,11 +72,12 @@ def import_services(source: Path, target: Path) -> list[str]:
     if not source.is_file():
         raise FileNotFoundError(source)
     incoming, existing = dotenv_values(source), dotenv_values(target)
-    keys = [key for key in incoming if key.startswith(("OSS__", "VIDEO_ANALYSIS__ASR_"))]
+    keys = [key for key in incoming if key.startswith(("OSS__", "ASR_", "VIDEO_ANALYSIS__ASR_"))]
     written = []
     for key in keys:
         if incoming[key] and not existing.get(key):
             set_key(target, key, incoming[key], quote_mode="always")
             written.append(key)
-    target.chmod(0o600)
+    if target.exists():
+        target.chmod(0o600)
     return written

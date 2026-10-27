@@ -2,7 +2,7 @@ import json
 import logging
 from pathlib import Path
 
-from pydantic import Field, ValidationError
+from pydantic import Field
 
 from .asr import Transcript
 from .llm import History, InputTooLarge, Model, OutputTruncated
@@ -27,11 +27,22 @@ class Read(Record):
     previous_episode: str = ""
 
 
+def batch_end(start: float, stop: float, batch_seconds: float, min_clip: float, max_span: float) -> float:
+    """分批时避免给下一批留下短于最短可编码片段的尾巴。"""
+    end = min(stop, start + batch_seconds)
+    if 0 < stop - end < min_clip:
+        if stop - start <= max_span:
+            return stop
+        end = max(start + min_clip, stop - min_clip)
+    return end
+
+
 TOOLS = [
     {"type": "function", "function": {"name": name, "description": description, "parameters": schema.model_json_schema()}}
     for name, description, schema in (
         ("inspect_clip", "重新观察已经提供过的时间范围，核对人物、动作或字幕；可裁剪局部。", Inspect),
-        ("read_script", "分页读取已有场景正文或人物及场景索引。previous_episode 可读取已完成集数的 Markdown，offset 为行号。", Read),
+        ("read_script", ("分页读取已有场景正文或人物及场景索引。previous_episode 可读取已完成集数的 Markdown；"
+                         "offset 在本集为分页序号，读取 previous_episode 时为行号。"), Read),
         ("update_script", "原子提交有限的剧本增量或局部修订；每次一个场景，最多 12 条正文。", Patch),
     )
 ]
@@ -50,16 +61,17 @@ class Agent:
         script.characters = dict(self.characters)
         script.continuity = self.continuity
         cursor, stop = window
+        batch_seconds = min(self.model.settings.batch_seconds, media.max_span)
         try:
             while cursor < stop - 1e-6:
-                end = min(stop, cursor + self.model.settings.batch_seconds)
+                end = batch_end(cursor, stop, batch_seconds, media.min_clip, media.max_span)
                 end = await self._batch(media, transcript, script, (cursor, end))
                 cursor = end
                 script.save(output, False, media.video.path, window)
                 log.info("%s %.1f/%.1fs scenes=%s blocks=%s calls=%s compact=%s",
                          script.episode, cursor, stop, len(script.scenes), script.block_counter,
                          self.model.calls, self.model.compactions)
-            await self._review(media, transcript, script, window)
+            await self._review(media, script, window)
             self._validate_completion(script, window)
         except BaseException:
             if script.scenes or script.coverage:
@@ -76,7 +88,7 @@ class Agent:
         while True:
             await transcript.ensure(min(media.video.duration, end + 3))
             script.cues.update({c.id: c for c in transcript.cues})
-            # 每次只发送当前片段的观察材料；前段衔接由精确保留的正文和连续性状态提供。
+            # 当前批次只附带这一段视频；此前的文字和工具结果保留，超预算时由 History 整理。
             observation = await media.clip(start, end)
             cues = transcript.between(max(0, start - 3), end + 3)
             used = script.used_cues()
@@ -91,9 +103,14 @@ class Agent:
             if (predicted < self.model.settings.context_window_tokens * 0.55
                     and len(dump(message).encode()) < self.model.settings.max_request_bytes * 0.8):
                 break
-            if end - start <= media.min_span:
+            remaining = end - start
+            if remaining <= media.min_span:
                 raise InputTooLarge("最小片段仍然超过预算，请增加上下文容量或降低视频片段大小")
-            end = start + max(media.min_span, int((end - start) / 2 / media.min_span) * media.min_span)
+            # 对半缩短，但保证两段都至少达到 min_clip，避免下一批只剩一个无法编码的尾巴。
+            span = min(max(media.min_span, remaining / 2), remaining - media.min_clip)
+            if span < media.min_clip:
+                raise InputTooLarge("最小片段仍然超过预算，请增加上下文容量或降低视频片段大小")
+            end = start + span
         script.video_ids.update(observation.ids)
         self.history.begin(message, observation.extra_tokens)
         await self._loop(media, script, (start, end), review=False)
@@ -131,7 +148,7 @@ class Agent:
                         pending_evidence.extend(observation.content)
                         pending_tokens += observation.extra_tokens
                     completed = completed or result.get("batch_complete", False)
-                except (ValidationError, ValueError, json.JSONDecodeError) as error:
+                except ValueError as error:
                     detail = str(error)[:1800]
                     if isinstance(error, json.JSONDecodeError):
                         detail += f"；错误位置附近：{error.doc[max(0, error.pos - 80):error.pos + 80]}"
@@ -168,8 +185,9 @@ class Agent:
                 return {"total_lines": len(lines), "lines": lines[args.offset:args.offset + args.limit * 3]}, None
             return script.read(args.scene_id, args.offset, args.limit, args.character), None
         if name == "inspect_clip":
-            if inspections >= 3:
-                raise ValueError("本段补充观察已达 3 次，请根据已有证据写作，将未解决问题写入 issues")
+            limit = min(3, self.model.settings.max_videos)
+            if inspections >= limit:
+                raise ValueError(f"本段补充观察已达 {limit} 次，请根据已有证据写作，将未解决问题写入 issues")
             args = Inspect.model_validate(arguments)
             observed_end = max(window[1], max((c["end"] for c in script.coverage), default=0))
             if args.end <= args.start or args.end > observed_end + 0.001:
@@ -181,8 +199,7 @@ class Agent:
             return {"video_ids": observation.ids, "question": args.question}, evidence
         raise ValueError(f"未知工具：{name}")
 
-    async def _review(self, media: Media, transcript: Transcript, script: Script,
-                      window: tuple[float, float]) -> None:
+    async def _review(self, media: Media, script: Script, window: tuple[float, float]) -> None:
         log.info("开始逐页核对 %s", script.episode)
         for page in script.pages():
             log.info("核对场景 %s，正文 %s–%s", page["scene_id"], page["blocks"][0]["id"], page["blocks"][-1]["id"])
@@ -210,12 +227,16 @@ class Agent:
             ranges = [(page_start, page_start + span),
                       ((page_start + page_stop - span) / 2, (page_start + page_stop + span) / 2),
                       (page_stop - span, page_stop)]
+        ranges = ranges[:self.model.settings.max_videos]
+        limit = self.model.settings.max_request_bytes * 0.8
         evidence, extra = [], 0
         for start, stop in ranges:
             start, stop = max(0.0, start), min(media.video.duration, stop)
             if stop - start < media.min_clip:
                 continue
             observation = await media.clip(start, stop)
+            if evidence and len(dump([*evidence, *observation.content]).encode()) > limit:
+                break
             script.video_ids.update(observation.ids)
             evidence.extend(observation.content)
             extra += observation.extra_tokens

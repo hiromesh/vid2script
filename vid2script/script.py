@@ -74,7 +74,7 @@ class Patch(Record):
     delete_block_ids: list[str] = Field(default_factory=list, max_length=12)
     excluded_cues: list[Exclusion] = Field(default_factory=list, max_length=32)
     issues: list[str] = Field(default_factory=list, max_length=10)
-    scene_finished: bool = False
+    scene_finished: bool | None = None
     continuity: str = Field(default="", max_length=1600)
     batch_complete: bool = False
     skip_reason: str = Field(default="", max_length=160)
@@ -141,7 +141,8 @@ class Script:
                 block_id = f"b{next_id:07}"
                 created.append(block_id)
                 scene.blocks[block_id] = block
-            scene.finished = patch.scene_finished
+            if patch.scene_finished is not None:
+                scene.finished = patch.scene_finished
             scenes[scene.id] = scene
         excluded = self._excluded(patch, scenes)
         used = self.used_cues(scenes)
@@ -231,17 +232,21 @@ class Script:
             if scene_id not in self.scenes:
                 raise ValueError("场景不存在")
             scene = self.scenes[scene_id]
-            blocks = list(scene.blocks.items())
-            return {"scene_id": scene.id, "scene": scene.info.model_dump(), "total": len(blocks),
-                    "next_offset": min(len(blocks), offset + limit),
-                    "blocks": [{"id": k, **v.model_dump()} for k, v in blocks[offset:offset + limit]],
-                    "characters": [self.characters[key].model_dump() for key in dict.fromkeys(
-                        b.character_id for _, b in blocks[offset:offset + limit] if b.character_id)]}
+            blocks = list(scene.blocks.items())[offset:offset + limit]
+            ids = dict.fromkeys([*scene.info.character_ids,
+                                 *(b.character_id for _, b in blocks if b.character_id)])
+            return {"scene_id": scene.id, "scene": scene.info.model_dump(),
+                    "total": len(scene.blocks), "next_offset": min(len(scene.blocks), offset + limit),
+                    "blocks": [{"id": key, **block.model_dump()} for key, block in blocks],
+                    "characters": [self.characters[key].model_dump() for key in ids][:30]}
         scenes = [s for s in self.scenes.values() if not character or
                   any(b.character_id == character for b in s.blocks.values())]
+        page = scenes[offset:offset + limit]
+        ids = {key for scene in page for key in scene.info.character_ids}
+        ids.update(b.character_id for scene in page for b in scene.blocks.values() if b.character_id)
         return {"total": len(scenes), "next_offset": min(len(scenes), offset + limit),
-                "scenes": [self._index(s) for s in scenes[offset:offset + limit]],
-                "characters": [c.model_dump() for c in list(self.characters.values())[offset:offset + limit]]}
+                "scenes": [self._index(s) for s in page],
+                "characters": [self.characters[key].model_dump() for key in sorted(ids)][:30]}
 
     @staticmethod
     def _index(scene: Scene) -> dict:
@@ -249,7 +254,8 @@ class Script:
 
     def state(self) -> dict:
         recent = list(self.scenes.values())[-3:]
-        ids = {b.character_id for s in recent for b in s.blocks.values() if b.character_id}
+        ids = {key for scene in recent for key in scene.info.character_ids}
+        ids.update(b.character_id for scene in recent for b in scene.blocks.values() if b.character_id)
         return {"continuity": self.continuity,
                 "recent_scenes": [self._index(s) for s in recent],
                 "recent_blocks": [{"id": k, **v.model_dump()} for s in recent[-1:]

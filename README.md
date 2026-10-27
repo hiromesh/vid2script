@@ -43,13 +43,16 @@
 | `VIDEO_MAX_BYTES` | 单个视频片段压缩后的字节上限，默认 8 MiB |
 | `MAX_VIDEO_SECONDS`、`MAX_VIDEOS` | 单个片段最长秒数与单次请求视频数量，默认 30 秒、3 段 |
 | `MAX_REQUEST_BYTES` | 单次请求序列化字节预算，默认 24 MiB |
+| `REQUEST_TIMEOUT_SECONDS` | 单次模型请求超时，默认 240 秒 |
 | `MAX_OUTPUT_TOKENS` | 服务端输出允许上限；实际每次写作最多使用 8192 tokens，并按上下文预算进一步限制 |
 | `THINKING_MODE` | `default` 使用模型默认值；支持该参数的模型可配置 `enabled` 或 `disabled` |
 | `REASONING_EFFORT` | 默认不发送；支持的模型可设置 `low`、`high`、`max` |
 | `COMPACT_THINKING_MODE` | 同一模型整理摘要时默认 `disabled`，将输出预算留给摘要；不支持该参数的服务配置为 `default` |
 | `CONTEXT_WINDOW_TOKENS` | 本工具使用的上下文预算，默认 131072；不要超过网关实际支持值 |
 | `BATCH_SECONDS` | 默认每批 30 秒；输入预算不足时自动缩短 |
+| `MAX_TURNS_PER_BATCH` | 每批最多工具调用轮数，默认 30 |
 | `ASR_SEGMENT_SECONDS` | 音频分段目标长度，默认 300 秒，在附近静音处切分并保留边界重叠 |
+| `ASR_POLL_INTERVAL_SECONDS` | ASR 任务轮询间隔，默认 2 秒 |
 | `VIDEO_ANALYSIS__ASR_API_KEY` | 字节 ASR 凭据 |
 | `VIDEO_ANALYSIS__ASR_RESOURCE_ID` | 默认 `volc.bigasr.auc` |
 | `VIDEO_ANALYSIS__ASR_TIMEOUT_SECONDS` | 识别任务等待时间，默认 900 秒 |
@@ -66,7 +69,7 @@
 
 ## 长视频处理
 
-- 按批生成无声视频片段，默认最长 30 秒；片段起始时间写入 `clip_id`，正文用 `video_ids` 引用画面证据。逐页核对按页面范围取最多 3 段短视频。
+- 按批生成无声视频片段，默认最长 30 秒；片段起止时间写入 `clip_id`，正文用 `video_ids` 引用画面证据。逐页核对按页面范围取最多 3 段短视频。
 - 每次只读取当前片段；MP4 编码完成后才转为 base64。已完成片段的视频从消息中移除，需要回看时重新提取。同一片段在多轮工具调用中会命中网关的前缀缓存。
 - `update_script` 每次最多提交 12 条正文，只修改一个场景。长场景允许无限次追加。操作 ID 保证同一次提交重试不会重复写入；参数验证通过后才原子更新正文。
 - 观察范围和写入完成分别管理。台词必须引用或明确说明排除原因，全部处理后才能推进批次。
@@ -85,7 +88,7 @@
 .venv/bin/ruff check .
 ```
 
-本地测试验证长场景多次增量写入、台词遗漏检查、重复提交、局部修订、ASR 时间偏移和重叠归属、视频片段编码、`video_ids` 证据与工具交互完整性。它们不使用模型或服务 mock。
+本地测试验证长场景多次增量写入、台词遗漏检查、重复提交、局部修订、ASR 时间偏移和重叠归属、视频片段编码与裁剪、`video_ids` 证据、上下文整理边界和分批边界。它们不使用模型或服务 mock。
 
 真实服务检查会调用模型、OSS 与字节 ASR，并产生相应 API 用量：
 
@@ -93,4 +96,4 @@
 .venv/bin/python scripts/check_services.py --env .work/test.env --video /path/01.mp4
 ```
 
-服务检查默认读取前 10 秒，可设置 `--start 180 --seconds 30`；端到端片段测试使用上面的 `--start` 和 `--end` 命令。
+服务检查需要带音轨的视频，默认读取前 10 秒，可设置 `--start 180 --seconds 30`；端到端片段测试使用上面的 `--start` 和 `--end` 命令。

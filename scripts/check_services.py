@@ -19,8 +19,10 @@ async def main() -> None:
     args = parser.parse_args()
     settings = Settings.load(args.env)
     work = Path(".work")
-    work.mkdir(exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
     video = await probe(args.video)
+    if not video.audio:
+        raise ValueError("服务检查需要带音轨的视频")
     model = Model(settings, work)
     try:
         with TemporaryDirectory(dir=work, prefix="service-check-") as directory:
@@ -31,7 +33,7 @@ async def main() -> None:
             cues = await speech.transcribe(path, 0, (start, start, end))
             print("ASR 台词数：", len(cues))
             print("ASR 示例：", [c.model_dump() for c in cues[:3]])
-            print("待清理 OSS 对象：", len(speech.active_keys))
+            print("OSS 临时对象剩余：", len(speech.active_keys))
             observation = await media.clip(start, min(end, start + media.max_span))
             response = await model.call([{"role": "user", "content": [
                 {"type": "text", "text": "请描述这段视频中可见的人物、场景和字幕，无法看清的内容不要猜测。"},

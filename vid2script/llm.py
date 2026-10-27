@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-from copy import deepcopy
 from pathlib import Path
 
 import tiktoken
@@ -24,13 +23,17 @@ class OutputTruncated(RuntimeError):
 
 
 def text_only(messages: list[dict], keep_reasoning: bool = True) -> list[dict]:
-    output = deepcopy(messages)
-    for message in output:
+    """移除非文本附件；未改动的消息只共享引用，不复制 base64 内容。"""
+    output = []
+    for message in messages:
         content = message.get("content")
         if isinstance(content, list):
-            message["content"] = [part for part in content if part.get("type") == "text"]
-        if not keep_reasoning:
-            message.pop("reasoning_content", None)
+            filtered = [part for part in content if part.get("type") == "text"]
+            if len(filtered) != len(content):
+                message = {**message, "content": filtered}
+        if not keep_reasoning and "reasoning_content" in message:
+            message = {key: value for key, value in message.items() if key != "reasoning_content"}
+        output.append(message)
     return output
 
 
@@ -133,17 +136,24 @@ class History:
             raise InputTooLarge("当前一段输入过大，需要缩小范围")
         summary_input = [{"role": "system", "content": (PROMPTS / "compact.md").read_text()},
                          {"role": "user", "content": dump({"history": old, "current_state": state})}]
-        result = await self.model.call(summary_input, output_tokens=3072, compact=True)
+        budget = min(3072, self.model.settings.output_budget)
+        result = await self.model.call(summary_input, output_tokens=budget, compact=True)
         summary = result.content
-        if not summary or len(self.model.encoding.encode(summary, disallowed_special=())) > 3072:
+        if not summary or len(self.model.encoding.encode(summary, disallowed_special=())) > budget:
             raise RuntimeError("compact 摘要为空或超过预算，原历史仍然保留")
         self.messages = [self.messages[0], {"role": "user", "content": "<compact-summary>\n" + summary +
                                           "\n</compact-summary>"}, *kept]
         self.turn_start = 2
-        self.extra_tokens = 0
+        kept_has_video = any(
+            part.get("type") == "video_url"
+            for message in kept if isinstance(message.get("content"), list)
+            for part in message["content"]
+        )
+        self.extra_tokens = self.extra_tokens if kept_has_video else 0
         self.model.compactions += 1
-        log.info("compact %s → %s estimated tokens", size, self.model.estimate(self.messages, tools))
-        if self.model.estimate(self.messages, tools) >= capacity * 0.7:
+        log.info("compact %s → %s estimated tokens", size,
+                 self.model.estimate(self.messages, tools, self.extra_tokens))
+        if self.model.estimate(self.messages, tools, self.extra_tokens) >= capacity * 0.7:
             raise InputTooLarge("compact 后当前片段仍超过上下文预算")
 
     def assistant(self, response) -> None:

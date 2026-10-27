@@ -48,8 +48,11 @@ class Speech:
             body = await self.recognize(url)
             return parse_transcript(body, segment, offset, core_start, core_end)
         finally:
-            await asyncio.to_thread(self.bucket.delete_object, key)
-            self.active_keys.remove(key)
+            try:
+                await asyncio.to_thread(self.bucket.delete_object, key)
+            except Exception:
+                log.warning("删除 OSS 临时对象失败：%s", key, exc_info=True)
+            self.active_keys.discard(key)
             path.unlink(missing_ok=True)
 
     async def recognize(self, audio_url: str) -> dict:
