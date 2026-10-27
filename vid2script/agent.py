@@ -6,7 +6,7 @@ from pydantic import Field, ValidationError
 
 from .asr import Transcript
 from .llm import History, InputTooLarge, Model, OutputTruncated
-from .media import Media
+from .media import Media, Observation
 from .script import Patch, Record, Script, dump
 
 log = logging.getLogger(__name__)
@@ -72,29 +72,30 @@ class Agent:
     async def _batch(self, media: Media, transcript: Transcript, script: Script,
                      window: tuple[float, float]) -> float:
         start, end = window
-        end = min(end, start + self.model.settings.max_images * media.video.interval)
+        end = min(end, start + media.max_span)
         while True:
             await transcript.ensure(min(media.video.duration, end + 3))
             script.cues.update({c.id: c for c in transcript.cues})
-            # 每次只发送当前片段图片；前段衔接由精确保留的正文和连续性状态提供。
-            content, frames = await media.images(start, end)
+            # 每次只发送当前片段的观察材料；前段衔接由精确保留的正文和连续性状态提供。
+            observation = await media.clip(start, end)
             cues = transcript.between(max(0, start - 3), end + 3)
             used = script.used_cues()
             intro = {"episode": script.episode, "title": script.title, "duration": media.video.duration,
-                     "responsible_range": [start, end], "sampling_interval": media.video.interval,
+                     "observation": media.describe(), "responsible_range": [start, end],
                      "transcript": [{**c.model_dump(), "already_written": c.id in used} for c in cues], "state": script.state(),
                      "missing_cues": script.missing(start, end), "previous_episodes": list(self.previous),
                      "instruction": "观察当前片段并增量提交剧本；参考范围中的旧台词不得重复。"}
-            message = [{"type": "text", "text": dump(intro)}, *content]
-            predicted = self.model.estimate([self.history.messages[0], {"role": "user", "content": message}], TOOLS)
+            message = [{"type": "text", "text": dump(intro)}, *observation.content]
+            predicted = self.model.estimate([self.history.messages[0], {"role": "user", "content": message}],
+                                            TOOLS, observation.extra_tokens)
             if (predicted < self.model.settings.context_window_tokens * 0.55
                     and len(dump(message).encode()) < self.model.settings.max_request_bytes * 0.8):
                 break
-            if end - start <= media.video.interval * 2:
-                raise InputTooLarge("最小片段仍然超过预算，请增加上下文容量或减少图片尺寸")
-            end = start + max(media.video.interval, int((end - start) / 2 / media.video.interval) * media.video.interval)
-        script.frame_ids.update(frames)
-        self.history.begin(message)
+            if end - start <= media.min_span:
+                raise InputTooLarge("最小片段仍然超过预算，请增加上下文容量或降低视频片段大小")
+            end = start + max(media.min_span, int((end - start) / 2 / media.min_span) * media.min_span)
+        script.video_ids.update(observation.ids)
+        self.history.begin(message, observation.extra_tokens)
         await self._loop(media, script, (start, end), review=False)
         return end
 
@@ -103,7 +104,8 @@ class Agent:
         for _ in range(self.model.settings.max_turns_per_batch):
             await self.history.prepare(TOOLS, script.state())
             try:
-                response = await self.model.call(self.history.messages, TOOLS)
+                response = await self.model.call(self.history.messages, TOOLS,
+                                                 extra_tokens=self.history.extra_tokens)
             except OutputTruncated:
                 truncations += 1
                 if truncations > 3:
@@ -118,13 +120,16 @@ class Agent:
                 continue
             self.history.assistant(response)
             completed = False
-            pending_images = []
+            pending_evidence: list[dict] = []
+            pending_tokens = 0
             for call in response.tool_calls:
                 try:
-                    result, images = await self._execute(call, media, script, window, review, inspections)
+                    result, observation = await self._execute(call, media, script, window, review, inspections)
                     if call.function.name == "inspect_clip":
                         inspections += 1
-                    pending_images.extend(images)
+                    if observation:
+                        pending_evidence.extend(observation.content)
+                        pending_tokens += observation.extra_tokens
                     completed = completed or result.get("batch_complete", False)
                 except (ValidationError, ValueError, json.JSONDecodeError) as error:
                     detail = str(error)[:1800]
@@ -135,31 +140,33 @@ class Agent:
                               "missing_cues": script.missing(*window)[:20]}
                     log.info("工具参数校验：%s", detail[:400])
                 self.history.result(call.id, result)
-            if pending_images:
-                # 新的观察替换当前旧图片，历史仍保留时间戳和工具结果。
+            if pending_evidence:
+                # 新的观察替换当前旧视频，历史仍保留片段 ID 和工具结果。
                 for message in self.history.messages:
                     if isinstance(message.get("content"), list):
-                        message["content"] = [p for p in message["content"] if p.get("type") != "image_url"]
-                self.history.messages.append({"role": "user", "content": pending_images})
+                        message["content"] = [p for p in message["content"]
+                                              if p.get("type") != "video_url"]
+                self.history.messages.append({"role": "user", "content": pending_evidence})
+                self.history.extra_tokens = pending_tokens
             if completed:
                 return
         raise RuntimeError(f"{window} 超过单段工具调用上限；已写正文保留，未标记完成")
 
     async def _execute(self, call, media: Media, script: Script, window: tuple[float, float],
-                       review: bool, inspections: int) -> tuple[dict, list[dict]]:
+                       review: bool, inspections: int) -> tuple[dict, Observation | None]:
         name, raw = call.function.name, call.function.arguments
         arguments = json.loads(raw)
         if name == "update_script":
             patch = Patch.model_validate(arguments)
-            return script.apply(patch, window, review), []
+            return script.apply(patch, window, review), None
         if name == "read_script":
             args = Read.model_validate(arguments)
             if args.previous_episode:
                 if args.previous_episode not in self.previous:
                     raise ValueError("指定集数尚未完成")
                 lines = self.previous[args.previous_episode].read_text().splitlines()
-                return {"total_lines": len(lines), "lines": lines[args.offset:args.offset + args.limit * 3]}, []
-            return script.read(args.scene_id, args.offset, args.limit, args.character), []
+                return {"total_lines": len(lines), "lines": lines[args.offset:args.offset + args.limit * 3]}, None
+            return script.read(args.scene_id, args.offset, args.limit, args.character), None
         if name == "inspect_clip":
             if inspections >= 3:
                 raise ValueError("本段补充观察已达 3 次，请根据已有证据写作，将未解决问题写入 issues")
@@ -167,10 +174,11 @@ class Agent:
             observed_end = max(window[1], max((c["end"] for c in script.coverage), default=0))
             if args.end <= args.start or args.end > observed_end + 0.001:
                 raise ValueError("观察范围必须在已经处理的时间范围内")
-            images, frames = await media.images(args.start, args.end, args.crop)
-            script.frame_ids.update(frames)
-            return {"frame_ids": frames, "question": args.question}, [
-                {"type": "text", "text": f"补充观察：{args.question}"}, *images]
+            observation = await media.clip(args.start, args.end, args.crop)
+            script.video_ids.update(observation.ids)
+            content = [{"type": "text", "text": f"补充观察：{args.question}"}, *observation.content]
+            evidence = Observation(content, observation.ids, observation.extra_tokens)
+            return {"video_ids": observation.ids, "question": args.question}, evidence
         raise ValueError(f"未知工具：{name}")
 
     async def _review(self, media: Media, transcript: Transcript, script: Script,
@@ -182,18 +190,36 @@ class Agent:
             prompt = {"mode": "review", "page": page, "state": script.state(),
                       "source_dialogue": [script.cues[key].model_dump() for key in sorted(ids)],
                       "instruction": "核对本页人物、台词、动作承接与重复。仅提交必要局部修订；完成后 batch_complete=true。"}
-            times = sorted({int(frame[1:]) / 1000 for block in page["blocks"] for frame in block["frame_ids"]})
-            evidence = []
-            if times:
-                selected = sorted({times[0], times[len(times) // 2], times[-1]})
-                for timestamp in selected:
-                    images, _ = await media.images(timestamp, min(media.video.duration, timestamp + media.video.interval))
-                    evidence.extend(images)
-            self.history.begin([{"type": "text", "text": dump(prompt)}, *evidence])
+            evidence, extra = await self._review_evidence(media, script, page["blocks"])
+            self.history.begin([{"type": "text", "text": dump(prompt)}, *evidence], extra)
             await self._loop(media, script, window, review=True)
             log.info("本页核对完成")
         if not script.scenes:
             log.info("当前范围没有剧情正文，保留非正文片段说明")
+
+    async def _review_evidence(self, media: Media, script: Script,
+                               blocks: list[dict]) -> tuple[list[dict], int]:
+        if not blocks:
+            return [], 0
+        page_start = min(block["start"] for block in blocks)
+        page_stop = max(block["end"] for block in blocks)
+        span = media.review_span
+        if page_stop - page_start <= span:
+            ranges = [(page_start, page_stop)]
+        else:
+            ranges = [(page_start, page_start + span),
+                      ((page_start + page_stop - span) / 2, (page_start + page_stop + span) / 2),
+                      (page_stop - span, page_stop)]
+        evidence, extra = [], 0
+        for start, stop in ranges:
+            start, stop = max(0.0, start), min(media.video.duration, stop)
+            if stop - start < media.min_clip:
+                continue
+            observation = await media.clip(start, stop)
+            script.video_ids.update(observation.ids)
+            evidence.extend(observation.content)
+            extra += observation.extra_tokens
+        return evidence, extra
 
     @staticmethod
     def _validate_completion(script: Script, window: tuple[float, float]) -> None:

@@ -32,7 +32,7 @@ class Block(Record):
     start: float = Field(ge=0)
     end: float = Field(ge=0)
     cue_ids: list[str] = Field(default_factory=list, max_length=20)
-    frame_ids: list[str] = Field(default_factory=list, max_length=20)
+    video_ids: list[str] = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="after")
     def valid(self) -> "Block":
@@ -40,8 +40,8 @@ class Block(Record):
             raise ValueError("正文结束时间早于开始时间")
         if self.kind == "dialogue" and not self.character_id:
             raise ValueError("对白必须关联人物；身份不明时建立暂用称呼")
-        if not self.cue_ids and not self.frame_ids:
-            raise ValueError("正文必须引用台词或图片证据")
+        if not self.cue_ids and not self.video_ids:
+            raise ValueError("正文必须引用台词或视频片段证据")
         return self
 
 
@@ -94,7 +94,7 @@ class Script:
         self.scenes: dict[str, Scene] = {}
         self.operations: dict[str, tuple[str, dict]] = {}
         self.cues: dict[str, Cue] = {}
-        self.frame_ids: set[str] = set()
+        self.video_ids: set[str] = set()
         self.exclusions: dict[str, Exclusion] = {}
         self.issues: list[str] = []
         self.coverage: list[dict] = []
@@ -185,8 +185,8 @@ class Script:
             raise ValueError(f"人物不存在：{block.character_id}")
         if any(c not in self.cues for c in block.cue_ids):
             raise ValueError("正文引用了未提供的台词 ID")
-        if any(f not in self.frame_ids for f in block.frame_ids):
-            raise ValueError("正文引用了未观察的图片 ID")
+        if any(v not in self.video_ids for v in block.video_ids):
+            raise ValueError("正文引用了未观察的视频片段 ID")
         if not review and (block.start < window[0] - 3 or block.start >= window[1] + 0.001):
             raise ValueError(f"新增正文 start={block.start} 超出当前负责范围 {window}：{block.text[:60]}。"
                              "此前正文应使用 replacements 和原 block_id 修订，不能再次追加。")
@@ -213,7 +213,7 @@ class Script:
             for block in scene.blocks.values():
                 if block.kind != "dialogue":
                     continue
-                identity = (tuple(sorted(block.cue_ids or block.frame_ids)), block.character_id, block.text)
+                identity = (tuple(sorted(block.cue_ids or block.video_ids)), block.character_id, block.text)
                 if identity in seen:
                     raise ValueError("同一台词被重复写入，请修改已有条目")
                 seen.add(identity)
@@ -272,6 +272,7 @@ class Script:
     def save(self, target: Path, complete: bool, source: Path, window: tuple[float, float]) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         lines = [f"# {self.title} {self.episode}", "", f"来源：{source.name}",
+                 "输入：视频片段（video_url）",
                  f"处理范围：{clock(window[0])}–{clock(window[1])}",
                  f"状态：{'已完成' if complete else '处理中，尚未完成核对'}", "", "## 本集人物", ""]
         used = {b.character_id for scene in self.scenes.values() for b in scene.blocks.values() if b.character_id}

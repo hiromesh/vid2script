@@ -24,6 +24,7 @@ def parser() -> argparse.ArgumentParser:
     process.add_argument("videos", nargs="+", type=Path)
     process.add_argument("--title", default="")
     process.add_argument("--movie", action="store_true", help="单个视频作为电影输出")
+    process.add_argument("--model", default="", help="覆盖 .env 中的 MODEL")
     process.add_argument("--first-episode", type=int, default=1)
     process.add_argument("--output", type=Path, default=Path("output"))
     process.add_argument("--work", type=Path, default=Path(".work"))
@@ -40,6 +41,8 @@ async def process(args: argparse.Namespace) -> None:
     if args.first_episode < 1:
         raise ValueError("集数必须为正数")
     settings = Settings.load(args.env)
+    if args.model:
+        settings = settings.model_copy(update={"model": args.model})
     args.work.mkdir(parents=True, exist_ok=True)
     model = Model(settings, args.work)
     agent = Agent(model)
@@ -70,7 +73,7 @@ async def process(args: argparse.Namespace) -> None:
         await model.close()
         stats = {key: getattr(model, key) for key in (
             "calls", "compactions", "prompt_tokens", "completion_tokens", "peak_estimated_tokens",
-            "peak_request_bytes", "peak_images")}
+            "peak_request_bytes", "peak_videos")}
         logging.getLogger(__name__).info("运行统计 %s", json.dumps(stats))
 
 

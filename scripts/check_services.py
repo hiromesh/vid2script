@@ -32,12 +32,12 @@ async def main() -> None:
             print("ASR 台词数：", len(cues))
             print("ASR 示例：", [c.model_dump() for c in cues[:3]])
             print("待清理 OSS 对象：", len(speech.active_keys))
-            images, _ = await media.images(start, min(end, start + video.interval))
+            observation = await media.clip(start, min(end, start + media.max_span))
             response = await model.call([{"role": "user", "content": [
-                {"type": "text", "text": "请描述这张图片中可见的人物、场景和字幕，无法看清的内容不要猜测。"},
-                *images,
-            ]}], output_tokens=1024)
-            print("图片输入结果：", response.content)
+                {"type": "text", "text": "请描述这段视频中可见的人物、场景和字幕，无法看清的内容不要猜测。"},
+                *observation.content,
+            ]}], output_tokens=1024, extra_tokens=observation.extra_tokens)
+            print("视频输入结果：", response.content)
             (work / "service_check.json").write_text(json.dumps({
                 "vision": response.content, "cues": [c.model_dump() for c in cues],
                 "oss_remaining": len(speech.active_keys),
